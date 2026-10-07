@@ -91,6 +91,12 @@ function validateOrder(input) {
   const shipByDate = str(i.shipByDate);
   if (shipByDate && !/^\d{2}\/\d{2}\/\d{4}$/.test(shipByDate)) errors.push("Ship-by date must look like 11/01/2026.");
 
+  // Order numbers returned by an earlier TEST order in this session. S&S's
+  // test orders may still look "active" in its order list, and they must not
+  // block the real order that follows with the same PO.
+  const ignoreOrderNumbers = [...new Set(toArray(i.ignoreOrderNumbers).map(str).filter(Boolean))];
+  if (ignoreOrderNumbers.length > 20 || ignoreOrderNumbers.some((n) => !/^[A-Za-z0-9]{1,20}$/.test(n))) errors.push("ignoreOrderNumbers must be a short list of order numbers.");
+
   const rawLines = toArray(i.lines);
   const lines = [];
   const seen = new Set();
@@ -118,6 +124,7 @@ function validateOrder(input) {
       shipByDate,
       shipBlind: i.shipBlind === true,
       testOrder: i.testOrder === true,
+      ignoreOrderNumbers,
       lines,
     },
   };
@@ -188,6 +195,48 @@ async function findOrdersByPo(poNumber) {
   return reply.body.map(normalizeOrder).filter((o) => o.poNumber.toLowerCase() === poNumber.toLowerCase());
 }
 
+/**
+ * Compares what S&S confirmed with what was asked for. S&S's reply is the
+ * source of truth for what was actually ordered, so any difference — a
+ * smaller quantity, a missing or extra item, totals that don't add up — is
+ * reported instead of being passed along as success.
+ */
+function verifyOrders(requestedLines, orders) {
+  const warnings = [];
+  const confirmed = new Map();
+  let anyItems = false;
+  orders.forEach((o) =>
+    o.items.forEach((it) => {
+      anyItems = true;
+      const k = String(it.sku || "").toLowerCase();
+      confirmed.set(k, (confirmed.get(k) || 0) + (it.qty || 0));
+    })
+  );
+
+  if (!anyItems) {
+    warnings.push("S&S's reply didn't list the items on the order, so the quantities couldn't be checked against what you asked for.");
+  } else {
+    requestedLines.forEach((l) => {
+      const got = confirmed.get(l.sku.toLowerCase()) || 0;
+      if (got !== l.qty) warnings.push(`${l.sku}: you ordered ${l.qty.toLocaleString()}, but S&S's order has ${got.toLocaleString()}.`);
+    });
+    confirmed.forEach((qty, k) => {
+      if (!requestedLines.some((l) => l.sku.toLowerCase() === k)) warnings.push(`S&S's order includes ${k.toUpperCase()} (${qty.toLocaleString()}), which you didn't order.`);
+    });
+  }
+
+  orders.forEach((o) => {
+    if (o.items.length === 0) return;
+    const pieces = o.items.reduce((s, it) => s + (it.qty || 0), 0);
+    if (o.pieces && o.pieces !== pieces) warnings.push(`Order ${o.orderNumber}: S&S says ${o.pieces.toLocaleString()} pieces, but its lines add up to ${pieces.toLocaleString()}.`);
+    if (o.items.every((it) => it.price != null) && o.subtotal != null) {
+      const merch = Math.round(o.items.reduce((s, it) => s + it.price * (it.qty || 0), 0) * 100) / 100;
+      if (Math.abs(merch - o.subtotal) > 0.05) warnings.push(`Order ${o.orderNumber}: S&S's merchandise total ($${o.subtotal.toFixed(2)}) doesn't match its line prices ($${merch.toFixed(2)}).`);
+    }
+  });
+  return warnings;
+}
+
 async function placeOrder(input, { dryRun = false } = {}) {
   const { errors, clean } = validateOrder(input);
   if (errors.length) throw fail(400, errors.join(" "), { details: errors });
@@ -195,9 +244,9 @@ async function placeOrder(input, { dryRun = false } = {}) {
   if (dryRun) return { dryRun: true, testOrder: payload.testOrder, payload };
 
   if (!payload.testOrder) {
-    const active = (await findOrdersByPo(clean.poNumber)).filter((o) => !o.cancelled);
+    const active = (await findOrdersByPo(clean.poNumber)).filter((o) => !o.cancelled && !clean.ignoreOrderNumbers.includes(String(o.orderNumber)));
     if (active.length) {
-      throw fail(409, `S&S already has an active order with PO ${clean.poNumber} (order ${active.map((o) => o.orderNumber).join(", ")}). Nothing was sent. Use a different PO number if this is a new order.`, { existing: active });
+      throw fail(409, `S&S already has an active order with PO ${clean.poNumber} (${active.map((o) => `order ${o.orderNumber}, ${o.status || "status unknown"}`).join("; ")}). Nothing was sent. Use a different PO number if this is a new order.`, { existing: active });
     }
   }
 
@@ -219,7 +268,8 @@ async function placeOrder(input, { dryRun = false } = {}) {
   if (!Array.isArray(reply.body) || reply.body.length === 0) throw fail(502, `S&S's reply wasn't a list of orders, so it isn't clear whether the order was placed. Check for PO ${clean.poNumber} before sending again.`, { unknownOutcome: true });
 
   const orders = reply.body.map(normalizeOrder);
-  return { testOrder: payload.testOrder, placedAt: new Date().toISOString(), orders, totals: totalsOf(orders) };
+  // `raw` is S&S's reply exactly as sent (order data only — no credentials), for checking against the summary.
+  return { testOrder: payload.testOrder, placedAt: new Date().toISOString(), orders, totals: totalsOf(orders), warnings: verifyOrders(clean.lines, orders), raw: reply.body };
 }
 
 async function getOrdersByPo(poNumber) {
@@ -241,4 +291,4 @@ async function cancelOrder(orderNumber) {
   return { cancelled };
 }
 
-module.exports = { SHIPPING_METHODS, validateOrder, buildPayload, normalizeOrder, placeOrder, getOrdersByPo, cancelOrder };
+module.exports = { SHIPPING_METHODS, verifyOrders, validateOrder, buildPayload, normalizeOrder, placeOrder, getOrdersByPo, cancelOrder };
