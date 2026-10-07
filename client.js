@@ -55,6 +55,11 @@ function buildPath({ style, skus, warehouses, fields }) {
     // Deliberate: S&S's full catalog is enormous. Always ask about something specific.
     throw Object.assign(new Error("Give a style or one or more SKUs — the full S&S catalog is too large to pull in one call."), { status: 400 });
   }
+  if (hasSkus && style) {
+    // S&S documents these as two separate lookups and never shows them
+    // combined, so don't send an undocumented mix and guess at the result.
+    throw Object.assign(new Error("Use either a style or SKUs, not both — S&S documents them as separate lookups. Clear one of the two boxes."), { status: 400 });
+  }
   const query = [];
   if (style) query.push(`style=${list(String(style).split(",").map((s) => s.trim()).filter(Boolean))}`);
   if (warehouses && warehouses.length) query.push(`Warehouses=${list(warehouses)}`);
@@ -62,15 +67,25 @@ function buildPath({ style, skus, warehouses, fields }) {
   return `/products/${hasSkus ? list(skus) : ""}${query.length ? `?${query.join("&")}` : ""}`;
 }
 
-async function get(path, { timeoutMs = 60000 } = {}) {
+async function request(method, path, { json, timeoutMs = 60000 } = {}) {
   let res;
   try {
     res = await fetch(baseUrl() + path, {
-      headers: { Authorization: authHeader(), Accept: "application/json" },
+      method,
+      headers: {
+        Authorization: authHeader(),
+        Accept: "application/json",
+        // S&S rejects a POST without this (documented, "Errors" page).
+        ...(json !== undefined ? { "Content-Type": "application/json" } : {}),
+      },
+      body: json !== undefined ? JSON.stringify(json) : undefined,
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (err) {
-    if (err.name === "TimeoutError" || err.name === "AbortError") throw new Error(`S&S didn't respond within ${Math.round(timeoutMs / 1000)}s`);
+    if (err.name === "TimeoutError" || err.name === "AbortError") {
+      // For an order, a timeout is NOT "didn't happen": S&S may have received it.
+      throw Object.assign(new Error(`S&S didn't respond within ${Math.round(timeoutMs / 1000)}s`), { timeout: true });
+    }
     throw new Error(`Couldn't reach S&S: ${err.cause?.code || err.message}`);
   }
   const text = await res.text();
@@ -83,8 +98,15 @@ async function get(path, { timeoutMs = 60000 } = {}) {
   return { status: res.status, ok: res.ok, text, body };
 }
 
-// S&S reports problems as { errors: [{ field, message }] }.
-const errorText = (body) => (body && Array.isArray(body.errors) ? body.errors.map((e) => (e.field ? `${e.field}: ` : "") + e.message).join("; ") : null);
+const get = (path, opts) => request("GET", path, opts);
+
+// S&S reports problems as { errors: [{ field, message }] } (400s), or just
+// { code, message } (500s).
+function errorText(body) {
+  if (!body) return null;
+  if (Array.isArray(body.errors) && body.errors.length) return body.errors.map((e) => (e.field ? `${e.field}: ` : "") + e.message).join("; ");
+  return typeof body.message === "string" ? body.message : null;
+}
 
 function normalizeProduct(p) {
   const warehouses = toArray(p.warehouses).map((w) => ({
@@ -177,22 +199,26 @@ function incomingSamples(items, limit = 15) {
  * list. { raw: true } returns S&S's reply text untouched, for debugging.
  */
 async function getProducts(args, { raw = false, timeoutMs } = {}) {
-  const reply = await get(buildPath(args), { timeoutMs });
-  if (raw) return { status: reply.status, raw: reply.text };
+  const path = buildPath(args);
+  // Echoed back with every answer so "not found" can be checked against what
+  // was actually asked. Holds only the style/SKU/filters — never credentials.
+  const requested = baseUrl().replace(/^https?:\/\/[^/]+/, "") + path;
+  const reply = await get(path, { timeoutMs });
+  if (raw) return { status: reply.status, requested, raw: reply.text };
 
   if (reply.status === 401 || reply.status === 403) {
     throw new Error(`S&S rejected the account number or API key (HTTP ${reply.status})${errorText(reply.body) ? `: ${errorText(reply.body)}` : ""}`);
   }
   if (reply.status === 404) {
     // Nothing matched (or the item is discontinued) — an answer, not a failure.
-    return { count: 0, items: [], warehouseCodes: [], notes: [], notFound: errorText(reply.body) || "Requested item(s) were not found or have been discontinued." };
+    return { requested, count: 0, items: [], warehouseCodes: [], notes: [], notFound: errorText(reply.body) || "Requested item(s) were not found or have been discontinued." };
   }
   if (reply.status === 429) throw new Error("S&S is rate-limiting requests (HTTP 429) — wait a minute and try again");
   if (!reply.ok) throw new Error(`S&S returned HTTP ${reply.status}${errorText(reply.body) ? `: ${errorText(reply.body)}` : `: ${reply.text.slice(0, 200)}`}`);
   if (!Array.isArray(reply.body)) throw new Error(`S&S's reply wasn't the expected list of products: ${reply.text.slice(0, 200)}`);
 
   const items = reply.body.map(normalizeProduct);
-  return { ...summarize(items), items };
+  return { requested, ...summarize(items), items };
 }
 
-module.exports = { getProducts, _internal: { buildPath, normalizeProduct, summarize, authHeader } };
+module.exports = { getProducts, request, errorText, num, toArray, _internal: { buildPath, normalizeProduct, summarize, authHeader } };
