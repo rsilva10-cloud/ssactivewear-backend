@@ -127,7 +127,49 @@ function summarize(items) {
   if (items.length && items.some((i) => i.prices.piece != null) && items.every((i) => !i.prices.customer)) {
     notes.push("No customer price came back on any item. S&S only returns your contracted price when \"API customer pricing\" is enabled on your account — ask your S&S rep to turn it on.");
   }
-  return { count: items.length, warehouseCodes: [...new Set(items.flatMap((i) => i.warehouses.map((w) => w.abbr)).filter(Boolean))].sort(), notes };
+  return {
+    count: items.length,
+    warehouseCodes: [...new Set(items.flatMap((i) => i.warehouses.map((w) => w.abbr)).filter(Boolean))].sort(),
+    notes,
+    warehouseStats: warehouseStats(items),
+    incomingSamples: incomingSamples(items),
+  };
+}
+
+// Per warehouse: how many SKUs, how many at zero, the highest quantity seen,
+// and how many SKUs sit exactly AT that highest quantity. If S&S caps the
+// quantity it reports (many SKUs all showing the same top number), this is
+// where it shows up — without assuming a cap exists.
+function warehouseStats(items) {
+  const stats = {};
+  items.forEach((i) =>
+    i.warehouses.forEach((w) => {
+      const s = (stats[w.abbr] = stats[w.abbr] || { skus: 0, zero: 0, max: 0, atMax: 0, total: 0 });
+      s.skus += 1;
+      s.total += w.qty;
+      if (w.qty === 0) s.zero += 1;
+      if (w.qty > s.max) s.max = w.qty;
+    })
+  );
+  items.forEach((i) => i.warehouses.forEach((w) => { if (w.qty === stats[w.abbr].max) stats[w.abbr].atMax += 1; }));
+  return stats;
+}
+
+// Every distinct incoming-stock string other than S&S's "nothing coming"
+// one, with an example and how often it appears — so the real formats can
+// be read off actual data instead of guessed.
+const NOTHING_INCOMING = "EnRoute:None|OnOrder:None";
+function incomingSamples(items, limit = 15) {
+  const seen = new Map();
+  items.forEach((i) =>
+    i.warehouses.forEach((w) => {
+      const e = w.expectedInventory;
+      if (!e || e === NOTHING_INCOMING) return;
+      if (!seen.has(e)) seen.set(e, { expectedInventory: e, example: { sku: i.sku, warehouse: w.abbr, qtyOnHand: w.qty }, occurrences: 0 });
+      seen.get(e).occurrences += 1;
+    })
+  );
+  return [...seen.values()].sort((a, b) => b.occurrences - a.occurrences).slice(0, limit);
 }
 
 /**
